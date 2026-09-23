@@ -240,5 +240,40 @@ def build_audit_csv(analysis: Mapping[str, Any]) -> bytes:
         w.writerow(["评委", "评分条数", "中位数", "MAD(原始)", "MAD(×1.4826)"])
         for g in analysis["groups"]:
             w.writerow([g["judge"], g["n"], _r4(g["median"]), _r4(g["raw_mad"]), _r4(g["mad"])])
+    w.writerow([])
+
+    # Section 5: persisted batch adjudication rules.
+    w.writerow(["【批处理裁决规则】按优先级数字从小到大裁决（数字相同时按规则顺序前者优先）"])
+    batch_rules: Sequence[Mapping[str, Any]] = analysis.get("batch_rules", [])
+    if batch_rules:
+        w.writerow(
+            [
+                "序号", "优先级", "规则名称", "评委(空=不限)", "项目(空=不限)",
+                "原始分下限", "原始分上限", "校准分下限", "校准分上限",
+                "采用选择", "理由模板",
+            ]
+        )
+
+        def _b(v):
+            return "" if v is None else _r4(v)
+
+        for pos, rule in enumerate(batch_rules, start=1):
+            w.writerow(
+                [
+                    pos,
+                    rule["priority"],
+                    rule.get("name", ""),
+                    rule.get("judge") or "",
+                    rule.get("item") or "",
+                    _b(rule.get("raw_min")),
+                    _b(rule.get("raw_max")),
+                    _b(rule.get("cal_min")),
+                    _b(rule.get("cal_max")),
+                    "保留原分" if rule["use_raw"] else "采用校准分",
+                    rule.get("reason_template", ""),
+                ]
+            )
+    else:
+        w.writerow(["（未保存批处理裁决规则）"])
 
     return ("﻿" + buf.getvalue()).encode("utf-8")

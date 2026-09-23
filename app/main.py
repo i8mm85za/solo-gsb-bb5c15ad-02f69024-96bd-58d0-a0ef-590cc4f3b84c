@@ -12,6 +12,12 @@ from pydantic import BaseModel, Field
 
 from . import database as db
 from .csv_io import CSVParseError, build_audit_csv, parse_scores
+from .rules import (
+    RuleValidationError,
+    evaluate_rules,
+    normalize_rules,
+    score_rows_from_analysis,
+)
 from .scoring import SCOPES, SCOPE_JUDGE, analyze, stability_experiment
 
 SAMPLE_PATH = os.environ.get(
@@ -32,7 +38,9 @@ app = FastAPI(title="多评委评分校准", version="1.0.0", lifespan=lifespan)
 def _build_analysis(conn, session_id: str, scope: str) -> dict[str, Any]:
     records = db.load_scores(conn, session_id)
     decisions = db.load_decisions(conn, session_id)
-    return analyze(records, decisions, scope=scope)
+    result = analyze(records, decisions, scope=scope)
+    result["batch_rules"] = db.load_rules(conn, session_id)
+    return result
 
 
 def _resolve_scope(conn, session_id: str, override: str | None) -> str:
@@ -56,6 +64,60 @@ class DecisionBody(BaseModel):
 class StabilityBody(BaseModel):
     exclude_type: Literal["judge", "item"]
     exclude_name: str = Field(min_length=1, max_length=200)
+
+
+class RuleBody(BaseModel):
+    name: str = Field(default="", max_length=200)
+    judge: str | None = None
+    item: str | None = None
+    raw_min: float | None = None
+    raw_max: float | None = None
+    cal_min: float | None = None
+    cal_max: float | None = None
+    use_raw: bool = False
+    reason_template: str = Field(default="", max_length=2000)
+    priority: int = Field(default=100, ge=0, le=1_000_000)
+
+
+class RuleSetBody(BaseModel):
+    rules: list[RuleBody] = Field(default_factory=list)
+
+
+def _normalize_session_rules(body: RuleSetBody, analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate/normalize submitted rules against the session's judge/item names."""
+    try:
+        rules = normalize_rules([r.model_dump() for r in body.rules])
+    except RuleValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    judges = set(analysis["judges"])
+    items = set(analysis["items"])
+    for i, rule in enumerate(rules, start=1):
+        if rule["judge"] is not None and rule["judge"] not in judges:
+            raise HTTPException(
+                status_code=400,
+                detail=f"第 {i} 条规则引用的评委「{rule['judge']}」不存在，可选：{', '.join(analysis['judges']) or '(无)'}。",
+            )
+        if rule["item"] is not None and rule["item"] not in items:
+            raise HTTPException(
+                status_code=400,
+                detail=f"第 {i} 条规则引用的项目「{rule['item']}」不存在，可选：{', '.join(analysis['items']) or '(无)'}。",
+            )
+    return rules
+
+
+def _rule_preview(analysis: dict[str, Any], rules: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run read-only rule matching on top of an analysis result."""
+    rows = score_rows_from_analysis(analysis)
+    decisions = {
+        s["id"]: (s["use_raw"], s["reason"])
+        for block in analysis["contestants"]
+        for ib in block["items"]
+        for s in ib["scores"]
+    }
+    preview = evaluate_rules(rows, rules, decisions)
+    preview["scope"] = analysis["scope"]
+    preview["scope_label"] = analysis["scope_label"]
+    return preview
 
 
 @app.get("/api/health")
@@ -135,6 +197,76 @@ def reset_decisions(session_id: str) -> dict[str, Any]:
         analysis = _build_analysis(conn, session_id, scope)
         analysis["reset_count"] = removed
         return analysis
+
+
+@app.get("/api/sessions/{session_id}/rules")
+def get_rules(session_id: str) -> dict[str, Any]:
+    with db.get_conn() as conn:
+        return {"rules": db.load_rules(conn, session_id)}
+
+
+@app.put("/api/sessions/{session_id}/rules")
+def save_rules(session_id: str, body: RuleSetBody) -> dict[str, Any]:
+    """Persist a rule set without applying it to any scores."""
+    with db.get_conn() as conn:
+        if db.get_scope(conn, session_id) is None:
+            raise HTTPException(status_code=404, detail="会话不存在，请先上传数据。")
+        scope = _resolve_scope(conn, session_id, None)
+        analysis = _build_analysis(conn, session_id, scope)
+        if analysis["counts"]["scores"] == 0:
+            raise HTTPException(status_code=400, detail="当前会话没有评分数据，无法保存规则。")
+        rules = _normalize_session_rules(body, analysis)
+        saved = db.replace_rules(conn, session_id, rules)
+    return {"saved": saved, "rules": rules}
+
+
+@app.post("/api/sessions/{session_id}/rules/preview")
+def preview_rules(session_id: str, body: RuleSetBody) -> dict[str, Any]:
+    """Read-only dry run: hit/miss/conflict counts and priority resolution.
+
+    Never persists rules and never modifies decisions.
+    """
+    with db.get_conn() as conn:
+        if db.get_scope(conn, session_id) is None:
+            raise HTTPException(status_code=404, detail="会话不存在，请先上传数据。")
+        scope = _resolve_scope(conn, session_id, None)
+        analysis = _build_analysis(conn, session_id, scope)
+        if analysis["counts"]["scores"] == 0:
+            raise HTTPException(status_code=400, detail="当前会话没有评分数据，无法预览规则。")
+        rules = _normalize_session_rules(body, analysis)
+        preview = _rule_preview(analysis, rules)
+    preview["rules_submitted"] = len(rules)
+    preview["rules_saved"] = len(analysis["batch_rules"])
+    return preview
+
+
+@app.post("/api/sessions/{session_id}/rules/apply")
+def apply_rules(session_id: str, body: RuleSetBody) -> dict[str, Any]:
+    """Persist rules and write all adjudications in a single transaction."""
+    with db.get_conn() as conn:
+        if db.get_scope(conn, session_id) is None:
+            raise HTTPException(status_code=404, detail="会话不存在，请先上传数据。")
+        scope = _resolve_scope(conn, session_id, None)
+        pre_analysis = _build_analysis(conn, session_id, scope)
+        if pre_analysis["counts"]["scores"] == 0:
+            raise HTTPException(status_code=400, detail="当前会话没有评分数据，无法应用规则。")
+        rules = _normalize_session_rules(body, pre_analysis)
+        preview = _rule_preview(pre_analysis, rules)
+        # Everything below commits together; any failure rolls the whole batch back.
+        db.replace_rules(conn, session_id, rules)
+        written = db.apply_batch_decisions(conn, session_id, preview["assignments"])
+        analysis = _build_analysis(conn, session_id, scope)
+    analysis["rules_saved"] = len(rules)
+    analysis["written"] = written
+    analysis["matched"] = preview["matched"]
+    analysis["unmatched"] = preview["unmatched"]
+    analysis["conflicted"] = preview["conflicted"]
+    analysis["changed"] = preview["would_change"]
+    analysis["rule_preview"] = {
+        k: preview[k]
+        for k in ("total_scores", "matched", "unmatched", "conflicted", "would_change", "rules")
+    }
+    return analysis
 
 
 @app.post("/api/sessions/{session_id}/stability")
