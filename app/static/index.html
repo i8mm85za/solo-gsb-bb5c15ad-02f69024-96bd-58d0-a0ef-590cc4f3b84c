@@ -65,9 +65,31 @@
       <div id="rank-table-wrap" class="table-wrap"></div>
     </section>
 
-    <!-- 4. 排名稳定性实验 -->
+    <!-- 4. 批量评分裁决规则 -->
     <section class="card">
-      <h2>④ 排名稳定性实验（临时模拟，不保存）</h2>
+      <h2>④ 批量评分裁决规则</h2>
+      <p class="hint">
+        按<b>评委 / 项目 / 原始分区间 / 校准分区间</b>组合条件批量设置裁决（区间端点包含边界，留空表示不限），
+        并为每条规则指定<b>优先级</b>（数字越小越优先；同优先级按规则排列顺序）。先<b>预览</b>每条规则的命中数、未命中数与多规则冲突，
+        系统按优先级对每条评分确定唯一结果；确认后在<b>一个事务</b>中批量写入裁决并刷新排名。
+        规则会随会话持久化；预览不修改任何裁决。理由模板支持占位符：
+        <code>{选手}</code> <code>{评委}</code> <code>{项目}</code> <code>{原始分}</code> <code>{校准分}</code> <code>{规则}</code> <code>{动作}</code>。
+      </p>
+      <div class="toolbar">
+        <button id="btn-rule-add" class="btn">＋ 新增规则</button>
+        <button id="btn-rule-preview" class="btn btn-primary">预览命中 / 冲突</button>
+        <button id="btn-rule-apply" class="btn btn-primary" disabled>确认并批量写入</button>
+        <button id="btn-rule-save" class="btn">仅保存规则</button>
+        <button id="btn-rule-clear" class="btn btn-ghost">清空全部规则</button>
+        <span id="rule-msg" class="msg"></span>
+      </div>
+      <div id="rule-editor"></div>
+      <div id="rule-preview"></div>
+    </section>
+
+    <!-- 5. 排名稳定性实验 -->
+    <section class="card">
+      <h2>⑤ 排名稳定性实验（临时模拟，不保存）</h2>
       <p class="hint">
         选择<b>临时排除一名评委或一个项目</b>，系统按当前校准范围重算原始分、校准分、最终总分与竞赛名次，
         并逐位展示每位选手相对基线的名次/总分变化及被移除的评分条数。
@@ -86,9 +108,9 @@
       <div id="stability-result" class="stability-result"></div>
     </section>
 
-    <!-- 5. 逐项裁决 -->
+    <!-- 6. 逐项裁决 -->
     <section class="card">
-      <h2>⑤ 逐项评分裁决</h2>
+      <h2>⑥ 逐项评分裁决</h2>
       <p class="hint">对每条原始评分选择「采用校准分」或「保留原分」并填写理由，排名将实时重算。</p>
       <div id="detail-panel"></div>
     </section>

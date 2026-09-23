@@ -31,10 +31,32 @@ CREATE TABLE IF NOT EXISTS decisions (
     session_id TEXT NOT NULL,
     use_raw INTEGER NOT NULL DEFAULT 0,
     reason TEXT NOT NULL DEFAULT '',
+    source_rule_id INTEGER,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (score_id) REFERENCES scores(id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_rule_id) REFERENCES adjudication_rules(id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS adjudication_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 100,
+    judge TEXT,
+    item TEXT,
+    raw_min REAL,
+    raw_max REAL,
+    cal_min REAL,
+    cal_max REAL,
+    use_raw INTEGER NOT NULL DEFAULT 0,
+    reason_template TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (session_id, id),
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_adjudication_rules_session
+    ON adjudication_rules(session_id, position);
 """
 
 
@@ -55,13 +77,34 @@ def get_conn() -> Iterator[sqlite3.Connection]:
     try:
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # Lightweight migration for databases created before batch rules.
+        if "source_rule_id" not in _table_columns(conn, "decisions"):
+            conn.execute("ALTER TABLE decisions ADD COLUMN source_rule_id INTEGER")
+
+
+def _nullable(value: Any) -> float | None:
+    return None if value is None else float(value)
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def ensure_session(conn: sqlite3.Connection, session_id: str, scope: str = "judge") -> None:
@@ -117,6 +160,117 @@ def load_decisions(conn: sqlite3.Connection, session_id: str) -> dict[int, tuple
         (session_id,),
     ).fetchall()
     return {r["score_id"]: (bool(r["use_raw"]), r["reason"]) for r in rows}
+
+
+def _rule_from_row(r: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": r["id"],
+        "position": r["position"],
+        "name": r["name"],
+        "priority": r["priority"],
+        "judge": r["judge"],
+        "item": r["item"],
+        "raw_min": r["raw_min"],
+        "raw_max": r["raw_max"],
+        "cal_min": r["cal_min"],
+        "cal_max": r["cal_max"],
+        "use_raw": bool(r["use_raw"]),
+        "reason_template": r["reason_template"],
+    }
+
+
+def load_rules(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM adjudication_rules WHERE session_id = ? ORDER BY position, id",
+        (session_id,),
+    ).fetchall()
+    return [_rule_from_row(r) for r in rows]
+
+
+def replace_rules(
+    conn: sqlite3.Connection, session_id: str, rules: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Replace the whole rule set for a session inside the current transaction.
+
+    Old decisions' provenance is detached (source_rule_id -> NULL) before the
+    rules are deleted, then the new rules are inserted in list order. Returns
+    the persisted rows (with fresh ids).
+    """
+    conn.execute(
+        "UPDATE decisions SET source_rule_id = NULL WHERE session_id = ?",
+        (session_id,),
+    )
+    conn.execute(
+        "DELETE FROM adjudication_rules WHERE session_id = ?", (session_id,)
+    )
+    saved: list[dict[str, Any]] = []
+    for position, rule in enumerate(rules):
+        cur = conn.execute(
+            "INSERT INTO adjudication_rules("
+            "session_id, position, name, priority, judge, item, "
+            "raw_min, raw_max, cal_min, cal_max, use_raw, reason_template) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                position,
+                rule["name"],
+                int(rule["priority"]),
+                _optional_text(rule.get("judge")),
+                _optional_text(rule.get("item")),
+                _nullable(rule.get("raw_min")),
+                _nullable(rule.get("raw_max")),
+                _nullable(rule.get("cal_min")),
+                _nullable(rule.get("cal_max")),
+                1 if rule["use_raw"] else 0,
+                rule.get("reason_template", ""),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM adjudication_rules WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        saved.append(_rule_from_row(row))
+    conn.execute(
+        "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?",
+        (session_id,),
+    )
+    return saved
+
+
+def bulk_upsert_decisions(
+    conn: sqlite3.Connection,
+    session_id: str,
+    outcomes: Sequence[dict[str, Any]],
+    source_rule_id_by_score: dict[int, int | None] | None = None,
+) -> tuple[int, int]:
+    """Upsert many decisions in the current transaction.
+
+    Returns ``(written, changed)`` where written is the number of upserted
+    rows and changed counts rows whose stored verdict/reason actually moved.
+    """
+    source_rule_id_by_score = source_rule_id_by_score or {}
+    written = changed = 0
+    for outcome in outcomes:
+        score_id = int(outcome["score_id"])
+        use_raw = 1 if outcome["use_raw"] else 0
+        reason = outcome.get("reason", "")
+        existing = conn.execute(
+            "SELECT use_raw, reason FROM decisions WHERE score_id = ? AND session_id = ?",
+            (score_id, session_id),
+        ).fetchone()
+        if existing is None:
+            changed += 1
+        elif bool(existing["use_raw"]) != bool(use_raw) or (existing["reason"] or "") != reason:
+            changed += 1
+        conn.execute(
+            "INSERT INTO decisions(score_id, session_id, use_raw, reason, source_rule_id) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(score_id) DO UPDATE SET use_raw=excluded.use_raw, "
+            "reason=excluded.reason, source_rule_id=excluded.source_rule_id, "
+            "updated_at=datetime('now')",
+            (score_id, session_id, use_raw, reason, source_rule_id_by_score.get(score_id)),
+        )
+        written += 1
+    return written, changed
 
 
 def upsert_decision(conn: sqlite3.Connection, session_id: str, score_id: int, use_raw: bool, reason: str) -> None:

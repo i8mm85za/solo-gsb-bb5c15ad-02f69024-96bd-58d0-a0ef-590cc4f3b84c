@@ -16,6 +16,8 @@ document.getElementById("session-id").textContent = SESSION_ID;
 // ---------- State ----------
 let analysis = null;
 let stability = null; // 排名稳定性实验结果（纯前端临时态，不持久化）
+let rulesState = [];  // 批量裁决规则编辑器内容（与服务端持久化同步）
+let rulePreview = null; // 最近一次预览结果（临时态，不代表已写入）
 
 const $ = (sel) => document.querySelector(sel);
 const dashboard = $("#dashboard");
@@ -87,6 +89,404 @@ function render() {
   renderRanks();
   renderDetails();
   renderStability();
+  renderRulesPanel();
+}
+
+// ---------- Batch adjudication rules ----------
+const ruleEditor = $("#rule-editor");
+const rulePreviewEl = $("#rule-preview");
+const ruleApplyBtn = $("#btn-rule-apply");
+
+function emptyRule() {
+  return {
+    name: "",
+    priority: rulesState.length ? Math.max(...rulesState.map((r) => Number(r.priority) || 0), 0) + 10 : 10,
+    judge: "",
+    item: "",
+    raw_min: "",
+    raw_max: "",
+    cal_min: "",
+    cal_max: "",
+    use_raw: false,
+    reason_template: "",
+  };
+}
+
+function setRuleMsg(text, cls = "") {
+  const el = $("#rule-msg");
+  el.textContent = text;
+  el.className = "msg " + cls;
+}
+
+// 数据/范围/裁决变化后，旧预览不再代表当前基线，需要重新预览。
+function invalidateRulePreview(silent = false) {
+  if (rulePreview) {
+    rulePreview = null;
+    ruleApplyBtn.disabled = true;
+    renderRulePreview();
+    if (!silent) setRuleMsg("数据已变化，请重新预览规则。");
+  }
+}
+
+function numOrEmpty(value) {
+  if (value === null || value === undefined) return "";
+  const n = Number(value);
+  return Number.isFinite(n) ? String(n) : "";
+}
+
+function renderRulesPanel() {
+  const hasData = !!(analysis && analysis.counts.scores > 0);
+  if (!hasData) {
+    ruleEditor.innerHTML = "";
+    rulePreviewEl.innerHTML = "";
+    rulePreview = null;
+    ruleApplyBtn.disabled = true;
+    return;
+  }
+  renderRuleEditor();
+  renderRulePreview();
+}
+
+function renderRuleEditor() {
+  if (!rulesState.length) {
+    ruleEditor.innerHTML = `<p class="rule-note">尚未定义规则。点击「＋ 新增规则」开始配置；也可以先只设置条件、不填规则名（将自动命名为规则1、规则2…）。</p>`;
+    return;
+  }
+  const judgeOpts = ["", ...analysis.judges];
+  const itemOpts = ["", ...analysis.items];
+  ruleEditor.innerHTML = rulesState.map((r, idx) => {
+    // Build selects with the current value selected.
+    const judgeSelect =
+      `<select data-field="judge">` +
+      judgeOpts.map((v) => `<option value="${esc(v)}"${v === r.judge ? " selected" : ""}>${v ? esc(v) : "不限评委"}</option>`).join("") +
+      `</select>`;
+    const itemSelect =
+      `<select data-field="item">` +
+      itemOpts.map((v) => `<option value="${esc(v)}"${v === r.item ? " selected" : ""}>${v ? esc(v) : "不限项目"}</option>`).join("") +
+      `</select>`;
+    return `
+    <div class="rule-row" data-index="${idx}">
+      <div class="rule-row-head">
+        <span class="rule-index">规则 ${idx + 1}</span>
+        <input type="text" class="rule-name" data-field="name" maxlength="100"
+               placeholder="规则名称（可留空自动命名）" value="${esc(r.name)}">
+        <button type="button" class="btn btn-ghost rule-remove" title="删除该规则">删除</button>
+      </div>
+      <div class="rule-grid">
+        <div class="field"><label>优先级（小=优先）</label>
+          <input type="number" step="1" min="0" data-field="priority" value="${esc(r.priority)}"></div>
+        <div class="field"><label>评委</label>${judgeSelect}</div>
+        <div class="field"><label>项目</label>${itemSelect}</div>
+        <div class="field"><label>原始分 ≥</label>
+          <input type="number" step="any" data-field="raw_min" value="${esc(numOrEmpty(r.raw_min))}"></div>
+        <div class="field"><label>原始分 ≤</label>
+          <input type="number" step="any" data-field="raw_max" value="${esc(numOrEmpty(r.raw_max))}"></div>
+        <div class="field"><label>校准分 ≥</label>
+          <input type="number" step="any" data-field="cal_min" value="${esc(numOrEmpty(r.cal_min))}"></div>
+        <div class="field"><label>校准分 ≤</label>
+          <input type="number" step="any" data-field="cal_max" value="${esc(numOrEmpty(r.cal_max))}"></div>
+        <div class="field"><label>裁决动作</label>
+          <select data-field="use_raw">
+            <option value="false"${r.use_raw ? "" : " selected"}>采用校准分</option>
+            <option value="true"${r.use_raw ? " selected" : ""}>保留原分</option>
+          </select></div>
+        <div class="field"><label>&nbsp;</label>
+          <button type="button" class="btn rule-remove">删除规则</button></div>
+      </div>
+      <div class="rule-reason">
+        <input type="text" data-field="reason_template" maxlength="2000"
+               placeholder="理由模板，如：{评委} 评委的 {原始分} 分偏离稳健分布，按规则「{规则}」{动作}；占位符 {选手}/{评委}/{项目}/{原始分}/{校准分}/{规则}/{动作}"
+               value="${esc(r.reason_template)}">
+      </div>
+    </div>`;
+  }).join("");
+
+  ruleEditor.querySelectorAll(".rule-row").forEach((row) => {
+    const idx = Number(row.dataset.index);
+    row.querySelectorAll("[data-field]").forEach((el) => {
+      const field = el.dataset.field;
+      const handler = () => {
+        let value = el.value;
+        if (field === "use_raw") value = value === "true";
+        if (field === "priority") value = value === "" ? "" : Math.max(0, parseInt(value, 10) || 0);
+        if (["raw_min", "raw_max", "cal_min", "cal_max"].includes(field)) {
+          if (value !== "" && !Number.isFinite(Number(value))) return;
+        }
+        rulesState[idx][field] = value;
+        invalidateRulePreview(true);
+        ruleApplyBtn.disabled = true;
+        setRuleMsg("规则已修改，请重新预览。");
+      };
+      el.addEventListener("input", handler);
+      el.addEventListener("change", handler);
+    });
+    row.querySelectorAll(".rule-remove").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        rulesState.splice(idx, 1);
+        invalidateRulePreview(true);
+        ruleApplyBtn.disabled = true;
+        renderRuleEditor();
+        setRuleMsg("已删除一条规则，请重新预览。");
+      });
+    });
+  });
+}
+
+function collectRulePayload() {
+  return rulesState.map((r) => ({
+    name: String(r.name || "").trim(),
+    priority: Number.isFinite(Number(r.priority)) && r.priority !== "" ? Number(r.priority) : 100,
+    judge: String(r.judge || "").trim(),
+    item: String(r.item || "").trim(),
+    raw_min: r.raw_min === "" ? null : Number(r.raw_min),
+    raw_max: r.raw_max === "" ? null : Number(r.raw_max),
+    cal_min: r.cal_min === "" ? null : Number(r.cal_min),
+    cal_max: r.cal_max === "" ? null : Number(r.cal_max),
+    use_raw: !!r.use_raw,
+    reason_template: String(r.reason_template || "").trim(),
+  }));
+}
+
+function validateRulesLocal() {
+  if (!rulesState.length) return "请至少新增一条规则。";
+  for (let i = 0; i < rulesState.length; i++) {
+    const r = rulesState[i];
+    const label = String(r.name || "").trim() || `规则${i + 1}`;
+    const checkPair = (lo, hi, what) => {
+      if (r[lo] !== "" && r[hi] !== "" && Number(r[lo]) > Number(r[hi])) {
+        return `${label} 的${what}区间下限不能大于上限。`;
+      }
+      return null;
+    };
+    const err =
+      checkPair("raw_min", "raw_max", "原始分") ||
+      checkPair("cal_min", "cal_max", "校准分");
+    if (err) return err;
+  }
+  return null;
+}
+
+function conditionText(r) {
+  const parts = [];
+  parts.push(r.judge ? `评委=${esc(r.judge)}` : "评委不限");
+  parts.push(r.item ? `项目=${esc(r.item)}` : "项目不限");
+  const range = (label, lo, hi) => {
+    if (lo === null && hi === null) return `${label}不限`;
+    if (lo === null) return `${label}≤${fmt(hi)}`;
+    if (hi === null) return `${label}≥${fmt(lo)}`;
+    return `${fmt(lo)}≤${label}≤${fmt(hi)}`;
+  };
+  parts.push(range("原分", r.raw_min, r.raw_max));
+  parts.push(range("校准分", r.cal_min, r.cal_max));
+  return parts.join("，");
+}
+
+function renderRulePreview() {
+  if (!rulePreview) {
+    rulePreviewEl.innerHTML = "";
+    return;
+  }
+  const s = rulePreview.summary;
+  const stats = [
+    ["评分总数", s.matched + s.unmatched, ""],
+    ["命中评分", s.matched, s.matched ? "" : "zero"],
+    ["未命中评分", s.unmatched, ""],
+    ["多规则冲突", s.conflicts, s.conflicts ? "warn" : ""],
+    ["实际变更条数", s.will_change, s.will_change ? "warn" : ""],
+    ["与现状相同", s.unchanged, ""],
+  ].map(([k, v, cls]) => `<div class="rule-stat ${cls}"><b>${v}</b><span>${k}</span></div>`).join("");
+
+  const ruleHead = `
+    <tr>
+      <th class="num">#</th><th>规则 / 组合条件</th><th class="num">优先级</th><th>动作</th>
+      <th class="num">命中数</th><th class="num">未命中数</th><th class="num">冲突数</th>
+      <th class="num">按优先级<br>最终采用</th><th class="num">将变更</th><th>理由示例</th>
+    </tr>`;
+  const ruleRows = rulePreview.rules.map((r, i) => `
+    <tr>
+      <td class="num">${i + 1}</td>
+      <td><b>${esc(r.name)}</b><div class="rule-conds">${conditionText(r)}</div></td>
+      <td class="num">${r.priority}</td>
+      <td><span class="action-tag ${r.use_raw ? "raw" : "cal"}">${esc(r.action_label)}</span></td>
+      <td class="num"><b>${r.hits}</b></td>
+      <td class="num">${r.misses}</td>
+      <td class="num">${r.conflicts ? `<span class="lost-note"><b>${r.conflicts}</b></span>` : 0}</td>
+      <td class="num">${r.chosen}${r.lost_to_priority ? `<div class="lost-note">${r.lost_to_priority} 条让位高优先级</div>` : ""}</td>
+      <td class="num">${r.will_change}</td>
+      <td class="rule-conds">${esc(r.reason_sample) || '<span class="delta-flat">（无模板 / 无命中）</span>'}</td>
+    </tr>`).join("");
+
+  let conflictBlock = "";
+  if (rulePreview.conflicts.length) {
+    const head = `
+      <tr>
+        <th class="num">评分ID</th><th>选手</th><th>评委</th><th>项目</th>
+        <th class="num">原始分</th><th class="num">校准分</th><th>命中规则（按优先级）</th><th>唯一采用</th>
+      </tr>`;
+    const rows = rulePreview.conflicts.map((c) => `
+      <tr class="conflict-row">
+        <td class="num">${c.score_id}</td>
+        <td>${esc(c.contestant)}</td>
+        <td>${esc(c.judge)}</td>
+        <td>${esc(c.item)}</td>
+        <td class="num">${fmt(c.raw)}</td>
+        <td class="num">${fmt(c.calibrated)}</td>
+        <td>${c.matched_names.map((n, k) =>
+          `优先级${c.matched_priorities[k]}：${esc(n)}`).join("<br>")}</td>
+        <td><b>优先级${c.winner_priority}：${esc(c.winner_name)}</b></td>
+      </tr>`).join("");
+    conflictBlock = `
+      <h3 class="sub">多规则冲突明细（${rulePreview.conflicts.length} 条评分命中多条规则，已按优先级取唯一结果）</h3>
+      <div class="table-wrap"><table>${head}${rows}</table></div>`;
+  }
+
+  rulePreviewEl.innerHTML = `
+    <div class="rule-preview-wrap">
+      <div class="rule-summary">${stats}</div>
+      <h3 class="sub">每条规则命中预览（校准范围：${esc(rulePreview.scope_label)}）</h3>
+      <div class="table-wrap"><table>${ruleHead}${ruleRows}</table></div>
+      ${conflictBlock}
+      <p class="rule-note">
+        预览仅做计算，<b>不会修改会话裁决或数据库</b>。点击「确认并批量写入」将在一个事务内写入
+        ${s.matched} 条裁决（其中实际变更 ${s.will_change} 条；未命中的 ${s.unmatched} 条评分保持现有裁决），并实时刷新排名。
+      </p>
+    </div>`;
+}
+
+$("#btn-rule-add").addEventListener("click", () => {
+  rulesState.push(emptyRule());
+  invalidateRulePreview(true);
+  ruleApplyBtn.disabled = true;
+  renderRuleEditor();
+  setRuleMsg("已新增一条规则。");
+  ruleEditor.scrollIntoView({ behavior: "smooth", block: "nearest" });
+});
+
+$("#btn-rule-preview").addEventListener("click", async () => {
+  const err = validateRulesLocal();
+  if (err) {
+    setRuleMsg(err, "error");
+    toast(err, true);
+    return;
+  }
+  setRuleMsg("预览计算中…");
+  try {
+    rulePreview = await api(`/api/sessions/${SESSION_ID}/rules/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rules: collectRulePayload() }),
+    });
+    renderRulePreview();
+    ruleApplyBtn.disabled = false;
+    const s = rulePreview.summary;
+    setRuleMsg(
+      `预览完成：命中 ${s.matched}、未命中 ${s.unmatched}、冲突 ${s.conflicts}、将变更 ${s.will_change} 条（预览未写入）。`,
+      "ok"
+    );
+  } catch (e) {
+    rulePreview = null;
+    ruleApplyBtn.disabled = true;
+    renderRulePreview();
+    setRuleMsg(e.message, "error");
+    toast("预览失败：" + e.message, true);
+  }
+});
+
+$("#btn-rule-apply").addEventListener("click", async () => {
+  if (!rulePreview) return;
+  const s = rulePreview.summary;
+  if (!confirm(
+    `确认按当前 ${rulePreview.rules.length} 条规则批量写入裁决？\n\n` +
+    `命中评分 ${s.matched} 条（未命中 ${s.unmatched} 条保持现状）；\n` +
+    `其中实际将变更 ${s.will_change} 条裁决。\n\n` +
+    `多规则冲突 ${s.conflicts} 条已按优先级确定唯一结果。该操作在一个事务中完成。`
+  )) return;
+  setRuleMsg("批量写入中…");
+  try {
+    analysis = await api(`/api/sessions/${SESSION_ID}/rules/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rules: collectRulePayload() }),
+    });
+    stability = null; // 裁决已变化，稳定性实验基线失效
+    rulePreview = null;
+    ruleApplyBtn.disabled = true;
+    const b = analysis.batch_result;
+    await loadRules();
+    render();
+    setRuleMsg(
+      `批量裁决完成：写入 ${b.written} 条，实际变更 ${b.changed} 条，命中 ${b.matched}、未命中 ${b.unmatched}、冲突 ${b.conflicts}。`,
+      "ok"
+    );
+    toast(`批量裁决完成，变更 ${b.changed} 条，排名已刷新`);
+  } catch (e) {
+    setRuleMsg(e.message, "error");
+    toast("批量写入失败：" + e.message, true);
+  }
+});
+
+$("#btn-rule-save").addEventListener("click", async () => {
+  const err = validateRulesLocal();
+  if (err) {
+    setRuleMsg(err, "error");
+    toast(err, true);
+    return;
+  }
+  setRuleMsg("保存规则中…");
+  try {
+    const data = await api(`/api/sessions/${SESSION_ID}/rules`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rules: collectRulePayload() }),
+    });
+    hydrateRules(data.rules);
+    invalidateRulePreview(true);
+    setRuleMsg(`已持久化 ${data.rules.length} 条规则（未修改任何裁决）。`, "ok");
+    toast("规则已保存");
+  } catch (e) {
+    setRuleMsg(e.message, "error");
+    toast("保存失败：" + e.message, true);
+  }
+});
+
+$("#btn-rule-clear").addEventListener("click", async () => {
+  if (!rulesState.length) return;
+  if (!confirm("确定清空全部已配置的规则？\n规则仅会被删除，已有裁决与理由保持不变。")) return;
+  try {
+    await api(`/api/sessions/${SESSION_ID}/rules`, { method: "DELETE" });
+    rulesState = [];
+    rulePreview = null;
+    ruleApplyBtn.disabled = true;
+    renderRuleEditor();
+    renderRulePreview();
+    setRuleMsg("已清空全部规则（裁决未改动）。", "ok");
+  } catch (e) {
+    toast("清空规则失败：" + e.message, true);
+  }
+});
+
+function hydrateRules(saved) {
+  rulesState = (saved || []).map((r) => ({
+    name: r.name || "",
+    priority: r.priority,
+    judge: r.judge || "",
+    item: r.item || "",
+    raw_min: r.raw_min === null || r.raw_min === undefined ? "" : r.raw_min,
+    raw_max: r.raw_max === null || r.raw_max === undefined ? "" : r.raw_max,
+    cal_min: r.cal_min === null || r.cal_min === undefined ? "" : r.cal_min,
+    cal_max: r.cal_max === null || r.cal_max === undefined ? "" : r.cal_max,
+    use_raw: !!r.use_raw,
+    reason_template: r.reason_template || "",
+  }));
+}
+
+async function loadRules() {
+  try {
+    const data = await api(`/api/sessions/${SESSION_ID}/rules`);
+    hydrateRules(data.rules);
+  } catch (_) {
+    rulesState = [];
+  }
 }
 
 // ---------- Ranking stability experiment ----------
@@ -336,6 +736,7 @@ async function pushDecision(scoreId, useRaw, reason) {
       }
     );
     stability = null; // 裁决变化会改变最终总分，实验结果作废
+    invalidateRulePreview(); // will_change 统计依赖裁决现状
     render();
     toast("排名已实时重算");
   } catch (err) {
@@ -374,10 +775,14 @@ async function loadAnalysis() {
   try {
     analysis = await api(`/api/sessions/${SESSION_ID}/analysis`);
     stability = null;
+    await loadRules();
+    invalidateRulePreview(true);
     render();
   } catch (_) {
     analysis = null;
     stability = null;
+    rulesState = [];
+    rulePreview = null;
     render();
   }
 }
@@ -401,6 +806,8 @@ $("#file-input").addEventListener("change", async (ev) => {
       body: fd,
     });
     stability = null;
+    await loadRules();
+    invalidateRulePreview(true);
     render();
     setMsg(`已导入 ${analysis.counts.scores} 条评分`, "ok");
     toast("上传成功，已完成稳健标准化");
@@ -420,6 +827,8 @@ $("#btn-sample").addEventListener("click", async () => {
       method: "POST",
     });
     stability = null;
+    await loadRules();
+    invalidateRulePreview(true);
     render();
     setMsg(`示例数据已载入（${analysis.counts.scores} 条评分）`, "ok");
     toast("示例数据已载入");
@@ -439,6 +848,7 @@ document.querySelectorAll('input[name="scope"]').forEach((radio) => {
         body: JSON.stringify({ scope: ev.target.value }),
       });
       stability = null; // 实验按校准范围重算，旧结果与新基线无关
+      invalidateRulePreview(); // 校准分区间随校准范围变化，旧预览失效
       render();
       toast("校准范围已切换");
     } catch (err) {
@@ -453,6 +863,7 @@ $("#btn-reset-decisions").addEventListener("click", async () => {
   try {
     analysis = await api(`/api/sessions/${SESSION_ID}/decisions/reset`, { method: "POST" });
     stability = null;
+    invalidateRulePreview();
     render();
     toast("已全部恢复为采用校准分");
   } catch (err) {
@@ -470,6 +881,9 @@ $("#btn-clear").addEventListener("click", async () => {
     await api(`/api/sessions/${SESSION_ID}`, { method: "DELETE" });
     analysis = null;
     stability = null;
+    rulesState = [];
+    rulePreview = null;
+    ruleApplyBtn.disabled = true;
     render();
     setMsg("会话已清空。");
     toast("会话已清空");
